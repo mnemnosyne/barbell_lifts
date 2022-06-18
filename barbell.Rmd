@@ -1,0 +1,173 @@
+---
+title: "Barebell Lifts"
+author: "Stephanie Conway"
+date: '2022-06-16'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(rattle)
+library(randomForest)
+library(parallel)
+library(doParallel)
+```
+
+## Barebell Lifts Classification
+In this work we will analyse data from accelerometers on the belt, forearm, arm,
+and dumbbell of 6 participants to quantify how well they perform barbell lifts 
+correctly and incorrectly in 5 different ways. Class A corresponds to the 
+specified execution of the exercise, while the other 4 classes correspond to 
+common mistakes.
+
+The sourse of the dataset is:
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+
+```{r}
+set.seed(12640)
+```
+
+### Reading in data
+
+
+```{r data_in}
+training <- read.csv("pml-training.csv", na.strings = c("NA", "","#DIV/0!"))
+testing <- read.csv("pml-testing.csv", na.strings = c("NA", "","#DIV/0!"))
+```
+
+### Preprocessing
+
+First we remove the columns that have over 90% NA values (sparse columns) and make our outcome (classe) a factor
+
+```{r}
+training <- training[ , colSums(is.na(training)) < 0.9*nrow(training)] 
+training$classe <- factor(training$classe)
+
+```
+
+We separate the training set further into a validation and true training set and remove the first 7 columns as they reflect identification of the data point and not the measurement (initial tree was able to classify based on the index alone with 66 % accuracy)
+
+```{r}
+training <- training[,8:60]
+inTrain <- createDataPartition(training$classe, p=0.7, list=FALSE)
+train <- training[inTrain,]
+valid <- training[-inTrain,]
+
+```
+
+### Base model: Classification Tree
+
+Since this is a classification problem we choose to use tree-based algorithms, starting with a classification tree. The caret package implements the rpart method with cp as the tuning parameter. caret by default will prune the tree based on a default run it makes on a default parameter grid.
+```{r}
+fit1 <- train(classe~., data=training, method='rpart')
+
+```
+
+```{r}
+fancyRpartPlot(fit1$finalModel)
+```
+
+Interestingly, of all the features, only pitch_forearm, magnet_dumbbell and roll_forearm are used. Also the tree doesn't have any rule for classe D. Let's examine the accuracy of this model based on the validation dataset.
+
+```{r}
+confusionMatrix(valid$classe,predict(fit1,valid))
+```
+The classification tree has an accuracy of 0.4911 (*estimated oob error of 51%*) 
+which is rather low.  
+We will use this as our baseline to see if we can improve upon this.
+
+### Random Forest Classification
+
+To run random forest I will enable parallel processing on my computer
+
+```{r}
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster)
+```
+
+We will train the random forest model with K-fold cross validation with 5 folds. 
+To do so we have to set the arguments from the trainControl function. 
+Then we train our model based on our training set.
+
+```{r}
+fitControl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+system.time(fit2 <- train(classe~., data=train, method='rf', trControl = fitControl, importance = T))
+fit2
+```
+
+And now we must deregister the parallel processing cluster
+```{r}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+The accuracy of the random forest classification, based on the validation set, is  
+```{r}
+confusionMatrix(valid$classe,predict(fit2,valid))
+```
+The accuracy is 99.6% on the validation data set (corresponding to an *estimated 
+oob error of 0.4%*)  which is a) near perfect and b) significantly better than 
+that of our base model (49%). In this case, random forest definitely improves 
+upon the base model.
+
+While the accuracy is outstanding, I think it would be interesting to see which 
+features really affect the classification. To this end, we will run the rfcv
+method.
+
+```{r}
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster)
+train.x <-subset(train, select = -c(classe))
+fitControl <- trainControl(allowParallel = TRUE)
+result <- rfcv(train.x,train$classe, cv.fold=3, trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+result$error.cv
+```
+
+```{r}
+with(result, plot(n.var, error.cv, log="x", type="o", lwd=2))
+```
+
+The error.cv decreases significantly between 1 to 6 features and then decreases 
+much more slowly after that. In an effort to balance bias and variance error we 
+will try to create a model with the 26 most important features which corresponds 
+to an error.cv of 1% which is only nominally worse that the error.cv of 0.75% for 
+all 52 features.
+
+WE will now train a new random forest model, this time only with the 26 most 
+important features as measured by our first run of the random forest algorithm 
+(accessed using varImp(fit2)$importance).
+
+```{r}
+new_train_x = train[,rownames(varImp(fit2)$importance)[1:26]]
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+system.time(fit3 <- train(x = new_train_x, y=train$classe,trControl = fitControl))
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+Now let's compare the accuracy on our validation set.
+
+```{r}
+confusionMatrix(valid$classe,predict(fit3,valid))
+```
+The accuracy has decreased, from 99.6% to 98%, (*or expected out of bag error 
+increase from 0.4% to 2%*). This suggests that over fitting may not have been an issue 
+when using all the data in the data set. 
+However, with such a small decrease in accuracy in the validation set we will 
+continue using this model in hopes to balance bias and variance.
+
+
+We will now run our selected model (fit3) on the testing dataset.
+
+```{r}
+testing.prediction <- predict(fit3,testing) 
+testing.prediction
+```
